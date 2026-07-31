@@ -1,19 +1,23 @@
 import http from 'node:http';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 const PORT = Number(process.env.PORT || 10000);
 const HOST = '0.0.0.0';
-const VERSION = '2.0.1-render-proof';
+const VERSION = '2.0.2-render-readonly';
 const SERVICE = 'ai-browser-operator-gateway';
 const DEVICE_ONLINE_MS = 45_000;
-const PAIR_TTL_MS = 10 * 60_000;
+const CONNECTOR_TTL_MS = 30 * 24 * 60 * 60_000;
 const JOB_TIMEOUT_MS = 35_000;
 const POLL_TIMEOUT_MS = 18_000;
 const MAX_BODY_BYTES = 2_500_000;
 const MAX_SCREENSHOT_BASE64 = 1_700_000;
+const SIGNING_SECRET = String(process.env.CONNECTOR_SIGNING_SECRET || '').trim();
+
+if (SIGNING_SECRET.length < 32) {
+  throw new Error('CONNECTOR_SIGNING_SECRET must be at least 32 characters.');
+}
 
 const devices = new Map();
-const pairCodes = new Map();
 const sessions = new Map();
 const jobs = new Map();
 const pollWaiters = new Map();
@@ -28,18 +32,39 @@ const CORS = {
 
 function nowIso() { return new Date().toISOString(); }
 function id(prefix = '') { return prefix + randomBytes(16).toString('hex'); }
-function sha256(value) { return createHash('sha256').update(value).digest('hex'); }
-function normaliseCode(value) { return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+function sha256(value) { return createHash('sha256').update(String(value)).digest('hex'); }
 function isDeviceId(value) { return /^device_[A-Za-z0-9_-]{12,}$/.test(String(value || '')); }
 function isDeviceSecret(value) { return /^[0-9a-fA-F]{48,160}$/.test(String(value || '')); }
 function isOnline(device) { return Boolean(device && Date.now() - device.lastSeenAt < DEVICE_ONLINE_MS); }
+function base64UrlEncode(value) { return Buffer.from(value).toString('base64url'); }
+function base64UrlDecode(value) { return Buffer.from(value, 'base64url').toString('utf8'); }
 
-function makePairCode() {
-  const alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-  const bytes = randomBytes(8);
-  let raw = '';
-  for (let i = 0; i < 8; i++) raw += alphabet[bytes[i] % alphabet.length];
-  return `${raw.slice(0, 4)}-${raw.slice(4)}`;
+function signPayload(encodedPayload) {
+  return createHmac('sha256', SIGNING_SECRET).update(encodedPayload).digest('base64url');
+}
+
+function issueConnectorToken(deviceId) {
+  const expiresAt = Date.now() + CONNECTOR_TTL_MS;
+  const encodedPayload = base64UrlEncode(JSON.stringify({ v: 1, d: deviceId, e: expiresAt }));
+  return { token: `${encodedPayload}.${signPayload(encodedPayload)}`, expiresAt };
+}
+
+function verifyConnectorToken(token) {
+  const source = String(token || '').trim();
+  const parts = source.split('.');
+  if (parts.length !== 2) return null;
+  const [encodedPayload, signature] = parts;
+  const expected = signPayload(encodedPayload);
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (actualBuffer.length !== expectedBuffer.length || !timingSafeEqual(actualBuffer, expectedBuffer)) return null;
+  try {
+    const payload = JSON.parse(base64UrlDecode(encodedPayload));
+    if (payload?.v !== 1 || !isDeviceId(payload?.d) || !Number.isFinite(payload?.e) || payload.e <= Date.now()) return null;
+    return { deviceId: payload.d, expiresAt: payload.e };
+  } catch {
+    return null;
+  }
 }
 
 function send(res, status, body = null, headers = {}) {
@@ -87,58 +112,3 @@ function authDevice(body) {
 
 function cleanup() {
   const now = Date.now();
-  for (const [code, info] of pairCodes) if (info.expiresAt <= now || info.used) pairCodes.delete(code);
-  for (const [jobId, job] of jobs) {
-    if (job.expiresAt <= now && !job.settled) {
-      job.settled = true;
-      clearTimeout(job.timeout);
-      job.resolve({ ok: false, error: 'Device job timeout' });
-      jobs.delete(jobId);
-    }
-  }
-}
-
-function toolError(message) {
-  return { content: [{ type: 'text', text: message }], isError: true };
-}
-function toolSuccess(data, text = null) {
-  return {
-    content: [{ type: 'text', text: text || JSON.stringify(data) }],
-    structuredContent: data,
-  };
-}
-
-function serialiseJob(jobId, job) {
-  return {
-    jobId,
-    tool: job.tool,
-    arguments: job.arguments,
-    createdAt: new Date(job.createdAt).toISOString(),
-    expiresAt: new Date(job.expiresAt).toISOString(),
-  };
-}
-
-function takeQueuedJob(deviceId) {
-  for (const [jobId, job] of jobs) {
-    if (job.deviceId === deviceId && !job.dispatched && !job.settled && job.expiresAt > Date.now()) {
-      job.dispatched = true;
-      return { jobId, job };
-    }
-  }
-  return null;
-}
-
-function wakePoller(deviceId) {
-  const waiters = pollWaititers?.get?.(deviceId) || pollWaiters.get(deviceId);
-  if (!waiters?.size) return;
-  const queued = takeQueuedJob(deviceId);
-  if (!queued) return;
-  const waiter = waiters.values().next().value;
-  waiters.delete(waiter);
-  if (!waiters.size) pollWaiters.delete(deviceId);
-  waiter.finish(200, { ok: true, job: serialiseJob(queued.jobId, queued.job) });
-}
-
-function enqueueToolJob(deviceId, tool, args) {
-  const jobId = id('job_');
-  const createdAt = Date.now();
