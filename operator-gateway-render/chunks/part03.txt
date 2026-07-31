@@ -1,0 +1,100 @@
+or(`Tool not found: ${name}`);
+  }
+
+  const execution = await enqueueToolJob(session.deviceId, name, args || {});
+  if (!execution?.ok) return toolError(String(execution?.error || 'Extension tool failed'));
+  if (name === 'capture_current_view') return screenshotToolResult(execution.result);
+  return toolSuccess(execution.result ?? {});
+}
+
+async function handleMcp(req, res, body) {
+  const incomingSession = req.headers['mcp-session-id'];
+  const sessionId = typeof incomingSession === 'string' && incomingSession ? incomingSession : id('mcp_');
+  let session = sessions.get(sessionId);
+  if (!session) {
+    session = { id: sessionId, deviceId: null, createdAt: Date.now() };
+    sessions.set(sessionId, session);
+  }
+  const headers = { 'mcp-session-id': sessionId };
+  const jsonrpc = body?.jsonrpc;
+  const method = body?.method;
+  const requestId = body?.id;
+  if (jsonrpc !== '2.0' || typeof method !== 'string') {
+    return send(res, 400, { jsonrpc: '2.0', id: requestId ?? null, error: { code: -32600, message: 'Invalid Request' } }, headers);
+  }
+  if (method === 'notifications/initialized' || method === 'notifications/cancelled') return send(res, 202, null, headers);
+
+  let result;
+  let error;
+  try {
+    switch (method) {
+      case 'initialize': {
+        const supported = ['2025-06-18', '2025-03-26', '2024-11-05'];
+        const requested = body?.params?.protocolVersion;
+        result = {
+          protocolVersion: supported.includes(requested) ? requested : supported[0],
+          serverInfo: { name: SERVICE, version: VERSION },
+          capabilities: { tools: { listChanged: false } },
+        };
+        break;
+      }
+      case 'ping': result = {}; break;
+      case 'tools/list': result = { tools: toolsList() }; break;
+      case 'tools/call': result = await handleToolCall(session, body?.params?.name, body?.params?.arguments || {}); break;
+      case 'prompts/list': result = { prompts: [] }; break;
+      case 'resources/list': result = { resources: [] }; break;
+      default: error = { code: -32601, message: `Method not found: ${method}` };
+    }
+  } catch (err) {
+    error = { code: -32603, message: 'Internal server error' };
+    console.error('[mcp_error]', err?.message || err);
+  }
+  const response = { jsonrpc: '2.0', id: requestId };
+  if (error) response.error = error; else response.result = result;
+  return send(res, 200, response, headers);
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const path = url.pathname;
+  try {
+    if (req.method === 'OPTIONS') return send(res, 204);
+    if (req.method === 'GET' && path === '/') {
+      return send(res, 200, `AI Browser Operator Gateway ${VERSION}\nMCP endpoint: /mcp\nRead-only proof. In-memory state resets on deploy/restart.`);
+    }
+    if (req.method === 'GET' && path === '/health') {
+      cleanup();
+      const onlineDevices = [...devices.values()].filter(isOnline).length;
+      return send(res, 200, { ok: true, service: SERVICE, version: VERSION, devices: devices.size, onlineDevices, sessions: sessions.size, pendingJobs: jobs.size, time: nowIso() });
+    }
+    if (path === '/mcp' && req.method === 'GET') return send(res, 405, 'Use POST /mcp', { allow: 'POST,DELETE' });
+    if (path === '/mcp' && req.method === 'DELETE') {
+      const sessionId = req.headers['mcp-session-id'];
+      if (typeof sessionId === 'string') {
+        const session = sessions.get(sessionId);
+        if (session?.deviceId) devices.get(session.deviceId)?.sessions.delete(sessionId);
+        sessions.delete(sessionId);
+      }
+      return send(res, 204);
+    }
+
+    if (req.method === 'POST' && path === '/api/device/register') {
+      const body = await readJson(req);
+      if (!isDeviceId(body.deviceId)) throw Object.assign(new Error('Invalid deviceId format'), { status: 400 });
+      if (!isDeviceSecret(body.deviceSecret)) throw Object.assign(new Error('Invalid deviceSecret format'), { status: 400 });
+      const secretHash = sha256(body.deviceSecret);
+      const existing = devices.get(body.deviceId);
+      if (existing && existing.secretHash !== secretHash) throw Object.assign(new Error('Device authentication failed'), { status: 401 });
+      const device = existing || { secretHash, lastSeenAt: 0, sessions: new Set() };
+      device.lastSeenAt = Date.now();
+      devices.set(body.deviceId, device);
+      return send(res, 200, { ok: true, gatewayVersion: VERSION, device: { deviceId: body.deviceId, online: true, lastSeenAt: nowIso(), pairedSessionCount: device.sessions.size } });
+    }
+
+    if (req.method === 'POST' && path === '/api/pair/start') {
+      const body = await readJson(req);
+      const { deviceId } = authDevice(body);
+      const pairingCode = makePairCode();
+      const expiresAt = Date.now() + PAIR_TTL_MS;
+      pairCodes.set(normaliseCode(pairingCode), { deviceId, expiresAt, invalidAttempts: 0, used: false });
+      return send(res, 200, { ok: true, pairingCode, expi
