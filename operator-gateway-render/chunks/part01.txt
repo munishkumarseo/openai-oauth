@@ -1,0 +1,144 @@
+import http from 'node:http';
+import { createHash, randomBytes } from 'node:crypto';
+
+const PORT = Number(process.env.PORT || 10000);
+const HOST = '0.0.0.0';
+const VERSION = '2.0.1-render-proof';
+const SERVICE = 'ai-browser-operator-gateway';
+const DEVICE_ONLINE_MS = 45_000;
+const PAIR_TTL_MS = 10 * 60_000;
+const JOB_TIMEOUT_MS = 35_000;
+const POLL_TIMEOUT_MS = 18_000;
+const MAX_BODY_BYTES = 2_500_000;
+const MAX_SCREENSHOT_BASE64 = 1_700_000;
+
+const devices = new Map();
+const pairCodes = new Map();
+const sessions = new Map();
+const jobs = new Map();
+const pollWaiters = new Map();
+
+const CORS = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
+  'access-control-allow-headers': 'content-type,authorization,mcp-session-id,mcp-protocol-version',
+  'access-control-expose-headers': 'mcp-session-id',
+  'cache-control': 'no-store',
+};
+
+function nowIso() { return new Date().toISOString(); }
+function id(prefix = '') { return prefix + randomBytes(16).toString('hex'); }
+function sha256(value) { return createHash('sha256').update(value).digest('hex'); }
+function normaliseCode(value) { return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+function isDeviceId(value) { return /^device_[A-Za-z0-9_-]{12,}$/.test(String(value || '')); }
+function isDeviceSecret(value) { return /^[0-9a-fA-F]{48,160}$/.test(String(value || '')); }
+function isOnline(device) { return Boolean(device && Date.now() - device.lastSeenAt < DEVICE_ONLINE_MS); }
+
+function makePairCode() {
+  const alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const bytes = randomBytes(8);
+  let raw = '';
+  for (let i = 0; i < 8; i++) raw += alphabet[bytes[i] % alphabet.length];
+  return `${raw.slice(0, 4)}-${raw.slice(4)}`;
+}
+
+function send(res, status, body = null, headers = {}) {
+  const finalHeaders = { ...CORS, ...headers };
+  if (body === null || status === 204) {
+    res.writeHead(status, finalHeaders);
+    res.end();
+    return;
+  }
+  if (typeof body === 'object' && !Buffer.isBuffer(body)) {
+    const payload = JSON.stringify(body);
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...finalHeaders });
+    res.end(payload);
+    return;
+  }
+  res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8', ...finalHeaders });
+  res.end(body);
+}
+
+async function readJson(req) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > MAX_BODY_BYTES) throw Object.assign(new Error('Request body too large'), { status: 413 });
+    chunks.push(chunk);
+  }
+  if (!chunks.length) return {};
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  catch { throw Object.assign(new Error('Invalid JSON body'), { status: 400 }); }
+}
+
+function authDevice(body) {
+  const deviceId = body?.deviceId;
+  const deviceSecret = body?.deviceSecret;
+  if (!isDeviceId(deviceId)) throw Object.assign(new Error('Invalid deviceId format'), { status: 400 });
+  if (!isDeviceSecret(deviceSecret)) throw Object.assign(new Error('Invalid deviceSecret format'), { status: 400 });
+  const device = devices.get(deviceId);
+  if (!device || device.secretHash !== sha256(deviceSecret)) {
+    throw Object.assign(new Error('Device authentication failed'), { status: 401 });
+  }
+  device.lastSeenAt = Date.now();
+  return { deviceId, device };
+}
+
+function cleanup() {
+  const now = Date.now();
+  for (const [code, info] of pairCodes) if (info.expiresAt <= now || info.used) pairCodes.delete(code);
+  for (const [jobId, job] of jobs) {
+    if (job.expiresAt <= now && !job.settled) {
+      job.settled = true;
+      clearTimeout(job.timeout);
+      job.resolve({ ok: false, error: 'Device job timeout' });
+      jobs.delete(jobId);
+    }
+  }
+}
+
+function toolError(message) {
+  return { content: [{ type: 'text', text: message }], isError: true };
+}
+function toolSuccess(data, text = null) {
+  return {
+    content: [{ type: 'text', text: text || JSON.stringify(data) }],
+    structuredContent: data,
+  };
+}
+
+function serialiseJob(jobId, job) {
+  return {
+    jobId,
+    tool: job.tool,
+    arguments: job.arguments,
+    createdAt: new Date(job.createdAt).toISOString(),
+    expiresAt: new Date(job.expiresAt).toISOString(),
+  };
+}
+
+function takeQueuedJob(deviceId) {
+  for (const [jobId, job] of jobs) {
+    if (job.deviceId === deviceId && !job.dispatched && !job.settled && job.expiresAt > Date.now()) {
+      job.dispatched = true;
+      return { jobId, job };
+    }
+  }
+  return null;
+}
+
+function wakePoller(deviceId) {
+  const waiters = pollWaititers?.get?.(deviceId) || pollWaiters.get(deviceId);
+  if (!waiters?.size) return;
+  const queued = takeQueuedJob(deviceId);
+  if (!queued) return;
+  const waiter = waiters.values().next().value;
+  waiters.delete(waiter);
+  if (!waiters.size) pollWaiters.delete(deviceId);
+  waiter.finish(200, { ok: true, job: serialiseJob(queued.jobId, queued.job) });
+}
+
+function enqueueToolJob(deviceId, tool, args) {
+  const jobId = id('job_');
+  const createdAt = Date.now();
