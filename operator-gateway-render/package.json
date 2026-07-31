@@ -1,0 +1,12 @@
+{
+  "name": "ai-browser-operator-gateway",
+  "version": "2.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
