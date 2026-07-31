@@ -1,20 +1,72 @@
-or(`Tool not found: ${name}`);
-  }
+      annotations: readOnly,
+    },
+  ];
+}
 
+function screenshotToolResult(extensionResult) {
+  const dataUrl = extensionResult?.dataUrl;
+  if (typeof dataUrl !== 'string') return toolError('Invalid screenshot result');
+  let mimeType;
+  let base64;
+  if (dataUrl.startsWith('data:image/jpeg;base64,')) {
+    mimeType = 'image/jpeg'; base64 = dataUrl.slice('data:image/jpeg;base64,'.length);
+  } else if (dataUrl.startsWith('data:image/png;base64,')) {
+    mimeType = 'image/png'; base64 = dataUrl.slice('data:image/png;base64,'.length);
+  } else return toolError('Invalid screenshot format');
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64) || base64.length > MAX_SCREENSHOT_BASE64) {
+    return toolError('Invalid or oversized screenshot data');
+  }
+  const metadata = { ...extensionResult };
+  delete metadata.dataUrl;
+  return {
+    content: [
+      { type: 'text', text: JSON.stringify(metadata) },
+      { type: 'image', data: base64, mimeType },
+    ],
+    structuredContent: metadata,
+  };
+}
+
+async function handleToolCall(session, name, args) {
+  if (!session.deviceId) return toolError('This connector URL is not linked to an extension device. Generate a fresh MCP connection URL in the extension and recreate the custom app.');
+  const device = devices.get(session.deviceId);
+  if (!isOnline(device)) return toolError('Connected extension is offline. Open the extension and keep companion mode enabled.');
+  if (!['get_extension_status', 'list_browser_tabs', 'inspect_current_page', 'capture_current_view'].includes(name)) {
+    return toolError(`Tool not found: ${name}`);
+  }
   const execution = await enqueueToolJob(session.deviceId, name, args || {});
   if (!execution?.ok) return toolError(String(execution?.error || 'Extension tool failed'));
   if (name === 'capture_current_view') return screenshotToolResult(execution.result);
   return toolSuccess(execution.result ?? {});
 }
 
-async function handleMcp(req, res, body) {
+function connectorDeviceFromPath(pathname) {
+  const match = pathname.match(/^\/mcp\/([^/]+)$/);
+  if (!match) return null;
+  return verifyConnectorToken(decodeURIComponent(match[1]));
+}
+
+async function handleMcp(req, res, body, connectorInfo) {
   const incomingSession = req.headers['mcp-session-id'];
   const sessionId = typeof incomingSession === 'string' && incomingSession ? incomingSession : id('mcp_');
   let session = sessions.get(sessionId);
   if (!session) {
-    session = { id: sessionId, deviceId: null, createdAt: Date.now() };
+    session = {
+      id: sessionId,
+      deviceId: connectorInfo?.deviceId || null,
+      connectorExpiresAt: connectorInfo?.expiresAt || null,
+      createdAt: Date.now(),
+      lastSeenAt: Date.now(),
+    };
     sessions.set(sessionId, session);
+  } else {
+    session.lastSeenAt = Date.now();
+    if (connectorInfo?.deviceId) {
+      session.deviceId = connectorInfo.deviceId;
+      session.connectorExpiresAt = connectorInfo.expiresAt;
+    }
   }
+
   const headers = { 'mcp-session-id': sessionId };
   const jsonrpc = body?.jsonrpc;
   const method = body?.method;
@@ -54,47 +106,9 @@ async function handleMcp(req, res, body) {
   return send(res, 200, response, headers);
 }
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const path = url.pathname;
-  try {
-    if (req.method === 'OPTIONS') return send(res, 204);
-    if (req.method === 'GET' && path === '/') {
-      return send(res, 200, `AI Browser Operator Gateway ${VERSION}\nMCP endpoint: /mcp\nRead-only proof. In-memory state resets on deploy/restart.`);
-    }
-    if (req.method === 'GET' && path === '/health') {
-      cleanup();
-      const onlineDevices = [...devices.values()].filter(isOnline).length;
-      return send(res, 200, { ok: true, service: SERVICE, version: VERSION, devices: devices.size, onlineDevices, sessions: sessions.size, pendingJobs: jobs.size, time: nowIso() });
-    }
-    if (path === '/mcp' && req.method === 'GET') return send(res, 405, 'Use POST /mcp', { allow: 'POST,DELETE' });
-    if (path === '/mcp' && req.method === 'DELETE') {
-      const sessionId = req.headers['mcp-session-id'];
-      if (typeof sessionId === 'string') {
-        const session = sessions.get(sessionId);
-        if (session?.deviceId) devices.get(session.deviceId)?.sessions.delete(sessionId);
-        sessions.delete(sessionId);
-      }
-      return send(res, 204);
-    }
+function publicOrigin(req) {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+  return `${forwardedProto}://${host}`;
+}
 
-    if (req.method === 'POST' && path === '/api/device/register') {
-      const body = await readJson(req);
-      if (!isDeviceId(body.deviceId)) throw Object.assign(new Error('Invalid deviceId format'), { status: 400 });
-      if (!isDeviceSecret(body.deviceSecret)) throw Object.assign(new Error('Invalid deviceSecret format'), { status: 400 });
-      const secretHash = sha256(body.deviceSecret);
-      const existing = devices.get(body.deviceId);
-      if (existing && existing.secretHash !== secretHash) throw Object.assign(new Error('Device authentication failed'), { status: 401 });
-      const device = existing || { secretHash, lastSeenAt: 0, sessions: new Set() };
-      device.lastSeenAt = Date.now();
-      devices.set(body.deviceId, device);
-      return send(res, 200, { ok: true, gatewayVersion: VERSION, device: { deviceId: body.deviceId, online: true, lastSeenAt: nowIso(), pairedSessionCount: device.sessions.size } });
-    }
-
-    if (req.method === 'POST' && path === '/api/pair/start') {
-      const body = await readJson(req);
-      const { deviceId } = authDevice(body);
-      const pairingCode = makePairCode();
-      const expiresAt = Date.now() + PAIR_TTL_MS;
-      pairCodes.set(normaliseCode(pairingCode), { deviceId, expiresAt, invalidAttempts: 0, used: false });
-      return send(res, 200, { ok: true, pairingCode, expi
