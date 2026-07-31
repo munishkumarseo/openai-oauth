@@ -1,0 +1,64 @@
+resAt: new Date(expiresAt).toISOString(), instructions: 'Ask ChatGPT to call pair_extension using this code.' });
+    }
+
+    if (req.method === 'POST' && path === '/api/jobs/next') {
+      const body = await readJson(req);
+      const { deviceId } = authDevice(body);
+      const queued = takeQueuedJob(deviceId);
+      if (queued) return send(res, 200, { ok: true, job: serialiseJob(queued.jobId, queued.job) });
+
+      let finished = false;
+      const finish = (status, payload) => {
+        if (finished || res.writableEnded) return;
+        finished = true;
+        clearTimeout(timer);
+        waiters.delete(waiter);
+        if (!waiters.size) pollWaiters.delete(deviceId);
+        send(res, status, payload);
+      };
+      const waiter = { finish };
+      const waiters = pollWaiters.get(deviceId) || new Set();
+      waiters.add(waiter);
+      pollWaiters.set(deviceId, waiters);
+      const timer = setTimeout(() => finish(204, null), POLL_TIMEOUT_MS);
+      req.on('close', () => {
+        if (!finished) {
+          finished = true;
+          clearTimeout(timer);
+          waiters.delete(waiter);
+          if (!waiters.size) pollWaiters.delete(deviceId);
+        }
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/api/jobs/result') {
+      const body = await readJson(req);
+      const { deviceId } = authDevice(body);
+      const job = jobs.get(body.jobId);
+      if (!job || job.deviceId !== deviceId) throw Object.assign(new Error('Job not found or unauthorized'), { status: 404 });
+      if (job.settled) return send(res, 200, { ok: true, duplicate: true });
+      job.settled = true;
+      clearTimeout(job.timeout);
+      jobs.delete(body.jobId);
+      job.resolve(body.ok === true ? { ok: true, result: body.result } : { ok: false, error: String(body.error || 'Extension tool failed').slice(0, 2000) });
+      return send(res, 200, { ok: true });
+    }
+
+    if (req.method === 'POST' && path === '/mcp') {
+      const body = await readJson(req);
+      return handleMcp(req, res, body);
+    }
+
+    return send(res, 404, { ok: false, error: 'Not found' });
+  } catch (err) {
+    const status = Number(err?.status) || 500;
+    if (status >= 500) console.error('[request_error]', err?.message || err);
+    return send(res, status, { ok: false, error: status >= 500 ? 'Internal server error' : err.message });
+  }
+});
+
+server.requestTimeout = 45_000;
+server.headersTimeout = 50_000;
+server.keepAliveTimeout = 5_000;
+server.listen(PORT, HOST, () => console.log(`[startup] ${SERVICE} ${VERSION} listening on ${HOST}:${PORT}`));
