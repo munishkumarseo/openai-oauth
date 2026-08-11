@@ -1,0 +1,27 @@
+{
+  "name": "photopea-mcp-render",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test:unit": "tsc -p tsconfig.unit.json && node --test test/*.unit.test.mjs",
+    "test:integration": "node --test test/bridge-server.integration.test.mjs test/mcp-sdk.integration.test.mjs test/photopea.integration.test.mjs",
+    "start": "node dist/src/index.js",
+    "audit:prod": "npm audit --omit=dev"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "puppeteer": "25.3.0",
+    "ws": "8.21.1",
+    "zod": "4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "@types/ws": "8.18.1",
+    "typescript": "5.9.2"
+  }
+}
